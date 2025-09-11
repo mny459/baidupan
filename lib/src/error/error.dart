@@ -52,3 +52,48 @@ class BaiduPanError with MapMixin<String, dynamic> implements Exception {
     return 'BaiduPanError: ${json.encode(responseMap)}';
   }
 }
+
+class BaiduPanAuthError with MapMixin<String, dynamic> implements Exception {
+  const BaiduPanAuthError(this.response);
+
+  final Response response;
+
+  String get body => response.body;
+
+  Map<String, dynamic> get responseMap =>
+      response.body.isEmpty ? {} : json.decode(response.body);
+
+  /// 错误码，为0表示没有错误，其他情况可以通过 [官网](https://pan.baidu.com/union/doc/okumlx17r) 查询
+  String get error => responseMap['error'];
+
+  /// 错误信息，可能为空
+  String? get errorDescription => responseMap['error_description'];
+
+  @override
+  dynamic operator [](Object? key) {
+    return responseMap[key];
+  }
+
+  @override
+  void operator []=(String key, value) {
+    throw UnimplementedError('[]= is not supported');
+  }
+
+  @override
+  void clear() {
+    throw UnimplementedError('The method "clear" is not implemented.');
+  }
+
+  @override
+  Iterable<String> get keys => responseMap.keys;
+
+  @override
+  dynamic remove(Object? key) {
+    throw UnimplementedError();
+  }
+
+  @override
+  String toString() {
+    return 'BaiduPanAuthError: ${json.encode(responseMap)}';
+  }
+}
