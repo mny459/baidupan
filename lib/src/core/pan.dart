@@ -160,7 +160,7 @@ class BaiduPan with BaiduPanMixin {
   ///
   /// 官方文档: https://pan.baidu.com/union/doc/pksg0s9ns
   Future<UserInfo> getUserInfo() async {
-    final map = await _get('/rest/2.0/xpan/nas', params: {'method': 'uinfo'});
+    final map = await _get('rest/2.0/xpan/nas', params: {'method': 'uinfo'});
     return UserInfo.fromJson(map);
   }
 
@@ -296,7 +296,7 @@ class BaiduPan with BaiduPanMixin {
     bool desc = false,
     bool web = true,
   }) async {
-    final path = '/rest/2.0/xpan/file';
+    final path = 'rest/2.0/xpan/file';
 
     var param = <String, String>{
       'method': 'doclist',
