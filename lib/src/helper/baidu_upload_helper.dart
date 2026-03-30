@@ -19,6 +19,8 @@ class BaiduUploadHelper with ILogger {
     required this.remotePath,
     required this.memberLevel,
     this.totalRetryCount = 10,
+    this.preCreateRtype = UploadRenameRtype.overwrite,
+    this.mergeRtype = UploadRenameRtype.overwrite,
   })  : localPath = File(localPath).absolute.path,
         lastModified = File(localPath).lastModifiedSync();
 
@@ -33,6 +35,13 @@ class BaiduUploadHelper with ILogger {
       localPath: resumeMap['localPath'],
       remotePath: resumeMap['remotePath'],
       memberLevel: resumeMap['memberLevel'],
+      preCreateRtype: UploadRenameRtype.values[
+        resumeMap['preCreateRtype'] as int? ?? UploadRenameRtype.none.index
+      ],
+      mergeRtype: UploadRenameRtype.values[
+        resumeMap['mergeRtype'] as int? ??
+            UploadRenameRtype.alwaysRename.index
+      ],
     );
 
     helper.resumeProgressInfo(resumeMap);
@@ -66,6 +75,12 @@ class BaiduUploadHelper with ILogger {
 
   /// 重试次数
   final int totalRetryCount;
+
+  /// 预上传阶段的同名处理策略
+  final UploadRenameRtype preCreateRtype;
+
+  /// 合并创建阶段的同名处理策略
+  final UploadRenameRtype mergeRtype;
 
   /// 上传的文件 md5 值， 保存进度的一部分
   BaiduMd5? _md5;
@@ -134,6 +149,8 @@ class BaiduUploadHelper with ILogger {
       'md5': md5.toMap(),
       'uploadCount': uploadCount,
       'lastModified': lastModified.millisecondsSinceEpoch,
+      'preCreateRtype': preCreateRtype.index,
+      'mergeRtype': mergeRtype.index,
     };
   }
 
@@ -232,6 +249,7 @@ class BaiduUploadHelper with ILogger {
     final preCreate = await uploader.preCreate(
       remotePath: remotePath,
       localPath: localPath,
+      rtype: preCreateRtype,
       memberLevel: memberLevel,
       uploadid: _uploadId,
       md5: md5,
@@ -288,6 +306,7 @@ class BaiduUploadHelper with ILogger {
       localPath: localPath,
       uploadid: uploadId,
       blockMd5List: blockMd5List,
+      rtype: mergeRtype,
     );
 
     log('上传完成：$complete');
