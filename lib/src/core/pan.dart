@@ -1,17 +1,17 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:baidupan/baidupan.dart';
 import 'package:http/http.dart' as http;
 
-import 'package:baidupan/baidupan.dart';
-
+part 'download.g.dart';
 part 'manager.g.dart';
-
 part 'upload.g.dart';
 
-part 'download.g.dart';
-
 String get _baseUrl => 'https://pan.baidu.com';
+
+const _defaultRequestTimeout = Duration(seconds: 60);
+const _uploadPartTimeout = Duration(minutes: 10);
 
 extension _UriExt on Uri {
   /// 把 accessToken 在日志中打码
@@ -78,7 +78,7 @@ mixin BaiduPanMixin {
       'access_token': accessToken,
     });
 
-    return http.get(uri, headers: headers);
+    return http.get(uri, headers: headers).timeout(_defaultRequestTimeout);
   }
 
   Future<Map> _post({
@@ -107,7 +107,7 @@ mixin BaiduPanMixin {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-    );
+    ).timeout(_defaultRequestTimeout);
     var responseBody = response.body;
     final map = json.decode(responseBody);
 

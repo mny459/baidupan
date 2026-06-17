@@ -36,12 +36,9 @@ class BaiduUploadHelper with ILogger {
       remotePath: resumeMap['remotePath'],
       memberLevel: resumeMap['memberLevel'],
       preCreateRtype: UploadRenameRtype.values[
-        resumeMap['preCreateRtype'] as int? ?? UploadRenameRtype.none.index
-      ],
-      mergeRtype: UploadRenameRtype.values[
-        resumeMap['mergeRtype'] as int? ??
-            UploadRenameRtype.alwaysRename.index
-      ],
+          resumeMap['preCreateRtype'] as int? ?? UploadRenameRtype.none.index],
+      mergeRtype: UploadRenameRtype.values[resumeMap['mergeRtype'] as int? ??
+          UploadRenameRtype.alwaysRename.index],
     );
 
     helper.resumeProgressInfo(resumeMap);
@@ -224,6 +221,7 @@ class BaiduUploadHelper with ILogger {
       uploadHandler?.onUploadStart(this);
       await _upload(uploadHandler);
       uploadHandler?.onUploadComplete(this);
+      _currentRetryCount = 0;
       _isUploading = false;
     } catch (e, st) {
       _isUploading = false;
@@ -236,7 +234,9 @@ class BaiduUploadHelper with ILogger {
       if (_currentRetryCount < totalRetryCount) {
         await Future.delayed(Duration(seconds: 1));
         await startUpload(uploadHandler);
+        return;
       }
+      rethrow;
     }
   }
 

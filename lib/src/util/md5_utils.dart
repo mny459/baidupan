@@ -1,4 +1,7 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:baidupan/src/util/pan_utils.dart';
 import 'package:crypto/crypto.dart';
@@ -68,6 +71,118 @@ class Md5Utils {
     accessFile.closeSync();
     return result;
   }
+
+  static Future<BaiduMd5Snapshot> getBaiduMd5SnapshotInIsolate({
+    required String filePath,
+    required int blockSize,
+    int sliceLength = 256 * 1024,
+  }) async {
+    final receivePort = ReceivePort();
+    try {
+      await Isolate.spawn(
+        _calculateBaiduMd5SnapshotEntry,
+        [receivePort.sendPort, filePath, blockSize, sliceLength],
+      );
+
+      final message = await receivePort.first;
+      if (message is Map && message['error'] != null) {
+        throw StateError(
+          '${message['error']}\n${message['stackTrace'] ?? ''}',
+        );
+      }
+      if (message is List && message.length == 3) {
+        return BaiduMd5Snapshot(
+          contentMd5: message[0] as String,
+          sliceMd5: message[1] as String,
+          blockMd5List: (message[2] as List).whereType<String>().toList(),
+        );
+      }
+      throw StateError('Invalid md5 isolate response: $message');
+    } finally {
+      receivePort.close();
+    }
+  }
+
+  @pragma('vm:entry-point')
+  static void _calculateBaiduMd5SnapshotEntry(List<dynamic> args) {
+    final sendPort = args[0] as SendPort;
+    final filePath = args[1] as String;
+    final blockSize = args[2] as int;
+    final sliceLength = args[3] as int;
+
+    try {
+      final snapshot = getBaiduMd5SnapshotSync(
+        filePath: filePath,
+        blockSize: blockSize,
+        sliceLength: sliceLength,
+      );
+      sendPort.send([
+        snapshot.contentMd5,
+        snapshot.sliceMd5,
+        snapshot.blockMd5List,
+      ]);
+    } catch (error, stackTrace) {
+      sendPort.send({
+        'error': error.toString(),
+        'stackTrace': stackTrace.toString(),
+      });
+    }
+  }
+
+  static BaiduMd5Snapshot getBaiduMd5SnapshotSync({
+    required String filePath,
+    required int blockSize,
+    required int sliceLength,
+  }) {
+    final file = File(filePath);
+    final accessFile = file.openSync(mode: FileMode.read);
+    final blockMd5List = <String>[];
+    final sliceBytes = BytesBuilder(copy: false);
+    final contentDigestSink = _DigestSink();
+    final contentSink = md5.startChunkedConversion(contentDigestSink);
+
+    try {
+      while (true) {
+        final block = accessFile.readSync(blockSize);
+        if (block.isEmpty) {
+          break;
+        }
+
+        contentSink.add(block);
+        blockMd5List.add(md5.convert(block).toString());
+
+        final remainingSliceBytes = sliceLength - sliceBytes.length;
+        if (remainingSliceBytes > 0) {
+          if (block.length <= remainingSliceBytes) {
+            sliceBytes.add(block);
+          } else {
+            sliceBytes.add(block.sublist(0, remainingSliceBytes));
+          }
+        }
+      }
+    } finally {
+      accessFile.closeSync();
+      contentSink.close();
+    }
+
+    return BaiduMd5Snapshot(
+      contentMd5: contentDigestSink.value.toString(),
+      sliceMd5: md5.convert(sliceBytes.takeBytes()).toString(),
+      blockMd5List: blockMd5List,
+    );
+  }
+}
+
+class BaiduMd5Snapshot {
+  final String contentMd5;
+  final String sliceMd5;
+  final List<String> blockMd5List;
+
+  const BaiduMd5Snapshot({
+    required this.contentMd5,
+    required this.sliceMd5,
+    required this.blockMd5List,
+  });
 }
 
 class BaiduMd5 {
@@ -109,13 +224,28 @@ class BaiduMd5 {
     return _blockMd5List!;
   }
 
+  Future<void> prepareInIsolate() async {
+    if (_contentMd5 != null && _sliceMd5 != null && _blockMd5List != null) {
+      return;
+    }
+
+    final snapshot = await Md5Utils.getBaiduMd5SnapshotInIsolate(
+      filePath: filePath,
+      blockSize: PanUtils.getBlockSize(memberLevel),
+    );
+
+    _contentMd5 = snapshot.contentMd5;
+    _sliceMd5 = snapshot.sliceMd5;
+    _blockMd5List = snapshot.blockMd5List;
+  }
+
   Map<String, dynamic> toMap() {
     return {
       'filePath': filePath,
       'memberLevel': memberLevel,
-      'blockMd5List': blockMd5List,
-      'contentMd5': contentMd5,
-      'sliceMd5': sliceMd5,
+      'blockMd5List': _blockMd5List,
+      'contentMd5': _contentMd5,
+      'sliceMd5': _sliceMd5,
     };
   }
 
@@ -124,10 +254,12 @@ class BaiduMd5 {
       filePath: map['filePath'],
       memberLevel: map['memberLevel'],
     );
-    instance._blockMd5List =
-        (map['blockMd5List'] as List).whereType<String>().toList();
-    instance._contentMd5 = map['contentMd5'];
-    instance._sliceMd5 = map['sliceMd5'];
+    final blockMd5List = map['blockMd5List'];
+    if (blockMd5List is List) {
+      instance._blockMd5List = blockMd5List.whereType<String>().toList();
+    }
+    instance._contentMd5 = map['contentMd5'] as String?;
+    instance._sliceMd5 = map['sliceMd5'] as String?;
     return instance;
   }
 }

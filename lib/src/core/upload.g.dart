@@ -114,6 +114,8 @@ class BaiduPanUploadManager with BaiduPanMixin {
           memberLevel: memberLevel,
         );
 
+    await baiduMd5.prepareInIsolate();
+
     final blockMd5 = baiduMd5.blockMd5List;
 
     body['block_list'] = json.encode(blockMd5);
@@ -198,8 +200,9 @@ class BaiduPanUploadManager with BaiduPanMixin {
 
     final request = http.MultipartRequest('POST', uri);
     request.files.add(formFile);
-    final response = await request.send();
-    final body = await utf8.decodeStream(response.stream);
+    final response = await request.send().timeout(_uploadPartTimeout);
+    final body =
+        await utf8.decodeStream(response.stream).timeout(_uploadPartTimeout);
     final map = json.decode(body);
 
     return UploadPart.fromJson(map, uploadBytes.length);
