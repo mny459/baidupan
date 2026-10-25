@@ -1,18 +1,18 @@
-// The file: null-safety
+import '../error/upload_validation_error.dart';
 
 // {"path":"\/apps\/dart\u4e0a\u4f20\/1.dart","uploadid":"N1-MjIxLjIxOS4xODQuODA6MTY0NjE5NDAzMzoyNTAzNjA1OTg3MDUxNTYwNTE=","return_type":1,"block_list":[0],"errno":0,"request_id":250360598705156051}
 class PreCreate {
   final String? path;
   final int returnType;
 
-  /// 文件块的 index 数组，理论上这个为空数组时，表示不需要上传文件块，可以支持秒传
+  /// 需要上传的分片索引；已规范化普通上传的空列表为第 0 片。
   final List<int> blockList;
   final int errno;
   final int requestId;
   final String? uploadId;
 
   // 秒传
-  bool get fastUpload => uploadId == null && blockList.isEmpty;
+  bool get fastUpload => returnType == 2;
 
   const PreCreate({
     required this.path,
@@ -24,23 +24,34 @@ class PreCreate {
   });
 
   static PreCreate fromJson(Map json) {
-    List<int> blockList;
-    final blockJson = json['block_list'];
-    if (blockJson != null) {
-      // ignore: no_leading_underscores_for_local_identifiers
-      final _blockValue = blockJson as List;
-      blockList = _blockValue.whereType<int>().toList();
-    } else {
-      blockList = [];
+    final returnType = json['return_type'];
+    final uploadId = json['uploadid'];
+    if (returnType is! int || (uploadId != null && uploadId is! String)) {
+      throw const BaiduUploadValidationException('百度网盘预上传响应格式无效');
     }
+    final blockJson = json['block_list'];
+    if ((blockJson == null && returnType != 2) ||
+        (blockJson != null &&
+            (blockJson is! List || blockJson.any((value) => value is! int)))) {
+      throw const BaiduUploadValidationException('百度网盘待上传分片索引必须为整数数组');
+    }
+    final rawBlocks =
+        blockJson == null ? <int>[] : (blockJson as List).cast<int>();
+    // 文档明确：普通上传返回空列表时等价于 [0]，不能直接跳过分片。
+    final blockList = returnType == 1 &&
+            uploadId is String &&
+            uploadId.isNotEmpty &&
+            rawBlocks.isEmpty
+        ? <int>[0]
+        : rawBlocks;
 
     return PreCreate(
       path: json['path'],
-      returnType: json['return_type'],
-      blockList: blockList,
+      returnType: returnType,
+      blockList: List<int>.unmodifiable(blockList),
       errno: json['errno'],
       requestId: json['request_id'],
-      uploadId: json['uploadid'],
+      uploadId: uploadId as String?,
     );
   }
 }

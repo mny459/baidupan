@@ -2,56 +2,72 @@ part of 'pan.dart';
 
 typedef Md5Calculated = void Function(BaiduMd5 md5);
 
-/// 处理上传文件
-///
-/// 具体的上传能力和限制请参考 [官网](https://pan.baidu.com/union/doc/3ksg0s9ye)
-///
-/// 总体步骤是：
-///
-/// 1. 预上传
-/// 2. 分片上传
-/// 3. 合并分片
-///
-///
-/// 切片规则
-///
-/// 普通用户单个分片大小固定为4MB（文件大小如果小于4MB，无需切片，直接上传即可），单文件总大小上限为4G。
-/// 普通会员用户单个分片大小上限为16MB，单文件总大小上限为10G。
-/// 超级会员用户单个分片大小上限为32MB，单文件总大小上限为20G。
+/// 百度网盘三阶段上传。手动调用时应为三个阶段传入同一个文件快照。
 class BaiduPanUploadManager with BaiduPanMixin {
-  /// > 官方关于上传文件夹限制的说明
-  /// >
-  /// > 每个第三方在网盘只能拥有一个文件夹用于存储上传文件，该文件夹必须位于/apps目录下，
-  /// > apps下的文件夹名称为申请接入填写的申请接入的产品名称，假如你申请接入的产品名称为”云存储“，
-  /// > 那么该文件夹为/apps/云存储，用户看到的文件夹为/我的应用数据/云存储。
-  ///
-  /// 但事实上，这限制经我测试，不存在
   const BaiduPanUploadManager({
     required this.accessToken,
     this.showLog = false,
-    this.secretAccessToken = false,
+    this.secretAccessToken = true,
+    this.onDiagnostic,
   });
 
   @override
   final String accessToken;
-
   @override
   final bool showLog;
-
   @override
   final bool secretAccessToken;
 
-  // final String appName;
+  /// 只输出字段摘要；不会包含令牌、原始路径、上传 ID 或文件 MD5。
+  final void Function(String message)? onDiagnostic;
 
-  /// 预上传，其实就是在远端创建文件或文件夹
-  ///
-  /// [remotePath] 为远端的上传
-  /// [localPath] 为本地的文件路径
-  /// [rtype] 为重命名策略
-  /// [uploadid] 为上传的id, 这个是远端的上传id，理论上是用于后续的分片上传
-  /// [memberLevel] 为用户的会员等级，这个等级决定了可以上传多大的文件和切片规则
-  /// [md5Calculated] 为md5计算完成后的回调，用于获取到md5值
-  ///
+  String _fingerprint(String value) =>
+      crypto.sha256.convert(utf8.encode(value)).toString().substring(0, 12);
+
+  void _diagnostic(Map<String, Object?> context) {
+    // 服务端诊断字段也只接受数值，避免异常响应回显敏感参数。
+    for (final key in ['errno', 'request_id', 'return_type', 'httpStatus']) {
+      final value = context[key];
+      final numericRequestId = key == 'request_id' &&
+          value is String &&
+          RegExp(r'^\d+$').hasMatch(value);
+      if (value is! int && !numericRequestId) context.remove(key);
+    }
+    final message = json.encode(context);
+    if (onDiagnostic != null) {
+      // 日志写入失败不能改变上传结果或触发上传重试。
+      try {
+        onDiagnostic!(message);
+      } catch (_) {
+        if (showLog) print(message);
+      }
+    } else if (showLog) {
+      print(message);
+    }
+  }
+
+  void _validatePath(String remotePath) {
+    if (!remotePath.startsWith('/') || remotePath.contains('\u0000')) {
+      throw BaiduUploadValidationException('百度网盘上传路径必须为有效的绝对路径');
+    }
+  }
+
+  bool _sameStat(FileStat before, FileStat after) =>
+      before.type == after.type &&
+      before.size == after.size &&
+      before.modified == after.modified &&
+      before.changed == after.changed;
+
+  void _validateSnapshot(
+      BaiduUploadSnapshot snapshot, String localPath, int memberLevel) {
+    if (File(snapshot.path).absolute.path != File(localPath).absolute.path ||
+        snapshot.memberLevel != memberLevel) {
+      throw BaiduUploadValidationException('上传快照与当前文件或会员等级不一致');
+    }
+    snapshot.validateUnchanged();
+  }
+
+  /// 预上传；参数中的大小与指纹必须来自同一份文件。
   Future<PreCreate> preCreate({
     required String remotePath,
     required String localPath,
@@ -60,89 +76,108 @@ class BaiduPanUploadManager with BaiduPanMixin {
     String? uploadid,
     BaiduMd5? md5,
     Md5Calculated? onMd5Calculated,
+    BaiduUploadSnapshot? snapshot,
+    int attempt = 1,
   }) async {
-    final path = 'rest/2.0/xpan/file';
-    final method = 'precreate';
-
-    // remotePath = '/apps/$appName/$remotePath';
-    final body = <String, String>{
-      'path': Uri.encodeComponent(remotePath),
-      // 'path': remotePath,
-      'autoinit': '1',
-      'rtype': rtype.index.toString(),
+    final context = <String, Object?>{
+      'stage': 'precreate',
+      'attempt': attempt,
+      'pathFingerprint': _fingerprint(remotePath),
+      'memberLevel': memberLevel,
+      'blockSize': PanUtils.getBlockSize(memberLevel),
+      'rtype': rtype.index,
+      'hasUploadId': uploadid != null,
+      if (uploadid != null) 'uploadIdFingerprint': _fingerprint(uploadid),
     };
-
-    // final srcLocalPath = localPath;
-    // // 先找到真实路径
-    // localPath = findRealPath(localPath);
-    //
-    // if (showLog) {
-    //   print('$srcLocalPath => $localPath');
-    // }
-
-    // path 上传后使用的文件绝对路径，需要urlencode
-    // size	int	是	4096	RequestBody参数	文件或目录的大小，单位B，目录的话大小为0
-    // isdir	int	是	0	RequestBody参数	是否目录，0 文件、1 目录
-    // autoinit	int	是	1	RequestBody参数	固定值1
-    // rtype	int	否	1	RequestBody参数	文件命名策略，默认0
-    // 0 为不重命名，返回冲突
-    // 1 为只要path冲突即重命名
-    // 2 为path冲突且block_list不同才重命名
-    // 3 为覆盖
-    // uploadid	string	否	P1-MTAuMjI4LjQzLjMxOjE1OTU4NTg==	RequestBody参数	上传id
-    // block_list	string	是	["98d02a0f54781a93e354b1fc85caf488", "ca5273571daefb8ea01a42bfa5d02220"]	RequestBody参数	文件各分片MD5数组的json串。block_list的含义如下，如果上传的文件小于4MB，其md5值（32位小写）即为block_list字符串数组的唯一元素；如果上传的文件大于4MB，需要将上传的文件按照4MB大小在本地切分成分片，不足4MB的分片自动成为最后一个分片，所有分片的md5值（32位小写）组成的字符串数组即为block_list。
-    // content-md5	string	否	b20f8ac80063505f264e5f6fc187e69a	RequestBody参数	文件MD5
-    // slice-md5	string	否	9aa0aa691s5c0257c5ab04dd7eddaa47	RequestBody参数	文件校验段的MD5，校验段对应文件前256KB
-    // local_ctime	string	否	1595919297	RequestBody参数	客户端创建时间， 默认为当前时间戳
-    // local_mtime	string	否	1595919297	RequestBody参数	客户端修改时间，默认为当前时间戳
-
-    // 根据本地的 localPath 来创建参数
-    if (FileSystemEntity.isDirectorySync(localPath)) {
-      // 文件夹
-      body['size'] = '0';
-      body['isdir'] = '1';
-    } else if (FileSystemEntity.isFileSync(localPath)) {
-      body['size'] = File(localPath).lengthSync().toString();
-      body['isdir'] = '0';
-    } else {
-      throw Exception('不支持的类型');
+    try {
+      _validatePath(remotePath);
+      if (uploadid != null && uploadid.isEmpty) {
+        throw BaiduUploadValidationException('预上传任务 ID 不能为空');
+      }
+      final file = File(localPath);
+      final before = file.statSync();
+      if (before.type != FileSystemEntityType.file) {
+        throw BaiduUploadValidationException('百度网盘上传源必须为已存在的普通文件');
+      }
+      if (snapshot != null) {
+        _validateSnapshot(snapshot, localPath, memberLevel);
+      }
+      final size = snapshot?.size ?? before.size;
+      context['size'] = size;
+      context['blockCount'] = PanUtils.validateUploadSize(size, memberLevel);
+      final baiduMd5 = snapshot?.md5 ??
+          md5 ??
+          BaiduMd5(filePath: localPath, memberLevel: memberLevel);
+      if (File(baiduMd5.filePath).absolute.path != file.absolute.path ||
+          baiduMd5.memberLevel != memberLevel) {
+        throw BaiduUploadValidationException('文件 MD5 与上传文件或分片规则不一致');
+      }
+      await baiduMd5.prepareInIsolate();
+      final blockMd5 = baiduMd5.blockMd5List;
+      PanUtils.validateBlockMd5List(
+        fileSize: size,
+        memberLevel: memberLevel,
+        blockMd5List: blockMd5,
+      );
+      final contentMd5 = await baiduMd5.contentMd5;
+      final sliceMd5 = baiduMd5.sliceMd5;
+      final md5Pattern = RegExp(r'^[0-9a-f]{32}$');
+      if (!md5Pattern.hasMatch(contentMd5) || !md5Pattern.hasMatch(sliceMd5)) {
+        throw BaiduUploadValidationException('文件校验值必须为 32 位小写 MD5');
+      }
+      onMd5Calculated?.call(baiduMd5);
+      if (!_sameStat(before, file.statSync())) {
+        throw BaiduUploadValidationException('计算上传参数时文件发生变化，请重新上传');
+      }
+      snapshot?.validateUnchanged();
+      context['blockListFingerprint'] = _fingerprint(json.encode(blockMd5));
+      final seconds =
+          (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+      final body = <String, String>{
+        'path': remotePath,
+        'size': size.toString(),
+        'isdir': '0',
+        'autoinit': '1',
+        'rtype': rtype.index.toString(),
+        'block_list': json.encode(blockMd5),
+        'content-md5': contentMd5,
+        'slice-md5': sliceMd5,
+        'local_ctime': seconds,
+        'local_mtime': seconds,
+        if (uploadid != null) 'uploadid': uploadid,
+      };
+      _diagnostic({...context, 'event': 'request'});
+      final map = await _post(
+        method: 'precreate',
+        bodyParams: body,
+        suppressLog: true,
+      );
+      final preCreate = PreCreate.fromJson(map);
+      _diagnostic({
+        ...context,
+        'event': 'response',
+        'errno': map['errno'],
+        'request_id': map['request_id'],
+        'return_type': preCreate.returnType,
+        'requestedBlockCount': preCreate.blockList.length,
+      });
+      return preCreate;
+    } catch (error) {
+      _diagnostic({
+        ...context,
+        'event': 'error',
+        'errorType': error.runtimeType.toString(),
+        if (error is BaiduPanError) ...{
+          'errno': error.responseMap['errno'],
+          'request_id': error.responseMap['request_id'],
+          'httpStatus': error.response.statusCode,
+        },
+        if (error is BaiduUploadValidationException)
+          'validationMessage': error.message,
+      });
+      rethrow;
     }
-
-    final baiduMd5 = md5 ??
-        BaiduMd5(
-          filePath: localPath,
-          memberLevel: memberLevel,
-        );
-
-    await baiduMd5.prepareInIsolate();
-
-    final blockMd5 = baiduMd5.blockMd5List;
-
-    body['block_list'] = json.encode(blockMd5);
-
-    body['content-md5'] = await baiduMd5.contentMd5;
-    body['slice-md5'] = baiduMd5.sliceMd5;
-
-    onMd5Calculated?.call(baiduMd5);
-
-    final now = DateTime.now().millisecondsSinceEpoch / 1000;
-    body['local_ctime'] = now.toString();
-    body['local_mtime'] = now.toString();
-
-    if (uploadid != null) {
-      body['uploadid'] = uploadid;
-    }
-
-    final map = await _post(
-      path: path,
-      method: method,
-      bodyParams: body,
-    );
-
-    return PreCreate.fromJson(map);
   }
-
-  int _getBlockSize(int memberLevel) => PanUtils.getBlockSize(memberLevel);
 
   Future<UploadPart> uploadSinglePart({
     required String remotePath,
@@ -150,98 +185,135 @@ class BaiduPanUploadManager with BaiduPanMixin {
     required int memberLevel,
     required String uploadid,
     required int partseq,
+    BaiduUploadSnapshot? snapshot,
   }) async {
-    final pcsHost = 'd.pcs.baidu.com';
-
-    final path = 'rest/2.0/pcs/superfile2';
-    final method = 'upload';
-
-    final params = {
-      'type': 'tmpfile',
-      'path': Uri.encodeComponent(remotePath),
-      'uploadid': uploadid,
-      'partseq': partseq.toString(),
-    };
-
-    final blockSize = _getBlockSize(memberLevel);
-
-    final file = File(localPath);
-    final accessFile = file.openSync();
-    final start = blockSize * partseq;
-    var end = start + blockSize;
-    final fileLength = file.lengthSync();
-    if (end > fileLength) {
-      end = fileLength;
+    _validatePath(remotePath);
+    if (uploadid.isEmpty) {
+      throw BaiduUploadValidationException('分片上传任务 ID 不能为空');
     }
-
-    final bufferSize = end - start;
-    final buffer = List<int>.filled(bufferSize, 0, growable: true);
-
-    accessFile.setPositionSync(start);
-    final readBufferSize = accessFile.readIntoSync(buffer, 0, bufferSize);
-    accessFile.closeSync();
-    final uploadBytes = buffer.sublist(0, readBufferSize);
-
-    final fileName = Uri.file(remotePath).pathSegments.last;
-    final formFile =
-        http.MultipartFile.fromBytes('file', uploadBytes, filename: fileName);
-
-    final queryParameters = {
-      'access_token': accessToken,
-      'method': method,
-      ...params,
-    };
+    if (snapshot != null) {
+      _validateSnapshot(snapshot, localPath, memberLevel);
+    }
+    final file = File(localPath);
+    final before = file.statSync();
+    final blockCount = PanUtils.validateUploadSize(before.size, memberLevel);
+    if (partseq < 0 || partseq >= blockCount) {
+      throw BaiduUploadValidationException('上传分片序号超出文件范围');
+    }
+    final blockSize = PanUtils.getBlockSize(memberLevel);
+    final start = blockSize * partseq;
+    final available = before.size - start;
+    final length = available < blockSize ? available : blockSize;
+    final uploadBytes = Uint8List(length);
+    final accessFile = file.openSync();
+    try {
+      accessFile.setPositionSync(start);
+      var read = 0;
+      while (read < length) {
+        final count = accessFile.readIntoSync(uploadBytes, read, length);
+        if (count == 0) {
+          throw BaiduUploadValidationException('上传文件读取不完整，请重新上传');
+        }
+        read += count;
+      }
+    } finally {
+      accessFile.closeSync();
+    }
+    if (!_sameStat(before, file.statSync())) {
+      throw BaiduUploadValidationException('读取上传分片时文件发生变化');
+    }
+    snapshot?.validateUnchanged();
     final uri = Uri(
-      host: pcsHost,
       scheme: 'https',
-      path: path,
-      queryParameters: queryParameters,
+      host: 'd.pcs.baidu.com',
+      path: '/rest/2.0/pcs/superfile2',
+      queryParameters: {
+        'access_token': accessToken,
+        'method': 'upload',
+        'type': 'tmpfile',
+        'path': remotePath,
+        'uploadid': uploadid,
+        'partseq': partseq.toString(),
+      },
     );
-
     final request = http.MultipartRequest('POST', uri);
-    request.files.add(formFile);
-    final response = await request.send().timeout(_uploadPartTimeout);
-    final body =
-        await utf8.decodeStream(response.stream).timeout(_uploadPartTimeout);
-    final map = json.decode(body);
-
+    request.files.add(http.MultipartFile.fromBytes(
+      'file',
+      uploadBytes,
+      filename: Uri.file(remotePath).pathSegments.last,
+    ));
+    final streamed = await request.send().timeout(_uploadPartTimeout);
+    final response =
+        await http.Response.fromStream(streamed).timeout(_uploadPartTimeout);
+    final map = json.decode(utf8.decode(response.bodyBytes));
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        (map['errno'] != null && map['errno'] != 0)) {
+      throw BaiduPanError(response);
+    }
+    if (map['md5'] is! String ||
+        !RegExp(r'^[0-9a-f]{32}$').hasMatch(map['md5'] as String)) {
+      throw BaiduUploadValidationException('分片上传响应缺少有效的 MD5');
+    }
     return UploadPart.fromJson(map, uploadBytes.length);
   }
 
-  /// 合并分片文件，并创建远端文件
+  /// 合并创建。传入 snapshot 时同时验证固定大小和完整分片清单。
   Future<UploadSuccess> merge({
     required String remotePath,
     required String localPath,
     required String uploadid,
     required List<String> blockMd5List,
     UploadRenameRtype rtype = UploadRenameRtype.alwaysRename,
+    BaiduUploadSnapshot? snapshot,
+    int? memberLevel,
   }) async {
-    final method = 'create';
-    var isdir = FileSystemEntity.isDirectorySync(localPath);
-    String size;
-    if (isdir) {
-      // 文件夹
-      size = '0';
-    } else if (FileSystemEntity.isFileSync(localPath)) {
-      size = File(localPath).lengthSync().toString();
-    } else {
-      throw Exception('不支持的类型');
+    _validatePath(remotePath);
+    if (uploadid.isEmpty) {
+      throw BaiduUploadValidationException('创建文件的上传任务 ID 不能为空');
     }
-
-    final bodyParams = {
-      'path': Uri.encodeComponent(remotePath),
-      'size': size,
-      'isdir': isdir ? '1' : '0',
-      'uploadid': uploadid,
-      'rtype': rtype.index.toString(),
-      'block_list': json.encode(blockMd5List),
-    };
-
+    final file = File(localPath);
+    final stat = file.statSync();
+    if (stat.type != FileSystemEntityType.file || stat.size <= 0) {
+      throw BaiduUploadValidationException('百度网盘不支持上传空文件或非普通文件');
+    }
+    final size = snapshot?.size ?? stat.size;
+    final level = snapshot?.memberLevel ?? memberLevel;
+    if (snapshot != null) {
+      _validateSnapshot(snapshot, localPath, snapshot.memberLevel);
+      if (memberLevel != null && memberLevel != snapshot.memberLevel) {
+        throw BaiduUploadValidationException('合并文件的分片规则与快照不一致');
+      }
+      if (json.encode(blockMd5List) != json.encode(snapshot.md5.blockMd5List)) {
+        throw BaiduUploadValidationException('合并文件的分片清单与上传快照不一致');
+      }
+    }
+    if (level != null) {
+      PanUtils.validateBlockMd5List(
+        fileSize: size,
+        memberLevel: level,
+        blockMd5List: blockMd5List,
+      );
+    } else if (size > PanUtils.getMaxFileSize(2) ||
+        blockMd5List.isEmpty ||
+        blockMd5List.length > PanUtils.maxBlockCount ||
+        blockMd5List
+            .any((value) => !RegExp(r'^[0-9a-f]{32}$').hasMatch(value))) {
+      // 保留旧的手动调用兼容性；其会员等级未知时不假设分片大小。
+      throw BaiduUploadValidationException('合并文件大小或分片清单无效');
+    }
     final map = await _post(
-      method: method,
-      bodyParams: bodyParams,
+      method: 'create',
+      bodyParams: {
+        'path': remotePath,
+        'size': size.toString(),
+        'isdir': '0',
+        'uploadid': uploadid,
+        'rtype': rtype.index.toString(),
+        'block_list': json.encode(blockMd5List),
+      },
+      suppressLog: true,
     );
-
     return UploadSuccess.fromJson(map);
   }
 }

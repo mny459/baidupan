@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:baidupan/src/error/upload_validation_error.dart';
 import 'package:baidupan/src/util/pan_utils.dart';
 import 'package:crypto/crypto.dart';
 
@@ -195,49 +196,96 @@ class BaiduMd5 {
   });
 
   String? _contentMd5;
+  String? _sliceMd5;
+  List<String>? _blockMd5List;
+  Map<String, int>? _fingerprint;
 
   Future<String> get contentMd5 async {
-    _contentMd5 ??= (await Md5Utils.getFileMd5(filePath));
+    await prepareInIsolate();
     return _contentMd5!;
   }
 
-  String? _sliceMd5;
-
   String get sliceMd5 {
-    _sliceMd5 ??= Md5Utils.getFileSliceMd5(filePath, 256 * 1024);
+    _prepareSync();
     return _sliceMd5!;
   }
 
-  List<String>? _blockMd5List;
-
   List<String> get blockMd5List {
-    if (_blockMd5List != null) {
-      return _blockMd5List!;
-    }
-
-    final blockSize = PanUtils.getBlockSize(memberLevel);
-    _blockMd5List ??= Md5Utils.getBlockList(
-      filePath,
-      blockSize,
-    );
-
+    _prepareSync();
     return _blockMd5List!;
   }
 
+  /// 所有摘要必须来自同一次读取；只有文件指纹相符时才复用缓存。
+  /// 旧版保存的摘要没有指纹，需要重新计算。
   Future<void> prepareInIsolate() async {
-    if (_contentMd5 != null && _sliceMd5 != null && _blockMd5List != null) {
-      return;
-    }
-
+    final before = _readFingerprint();
+    if (_hasValidCache(before)) return;
+    _clearCache();
     final snapshot = await Md5Utils.getBaiduMd5SnapshotInIsolate(
       filePath: filePath,
       blockSize: PanUtils.getBlockSize(memberLevel),
     );
+    _acceptSnapshot(snapshot, before);
+  }
 
+  void _prepareSync() {
+    final before = _readFingerprint();
+    if (_hasValidCache(before)) return;
+    _clearCache();
+    final snapshot = Md5Utils.getBaiduMd5SnapshotSync(
+      filePath: filePath,
+      blockSize: PanUtils.getBlockSize(memberLevel),
+      sliceLength: 256 * 1024,
+    );
+    _acceptSnapshot(snapshot, before);
+  }
+
+  bool _hasValidCache(Map<String, int> fingerprint) =>
+      _contentMd5 != null &&
+      _sliceMd5 != null &&
+      _blockMd5List != null &&
+      _sameFingerprint(_fingerprint, fingerprint);
+
+  void _clearCache() {
+    _contentMd5 = null;
+    _sliceMd5 = null;
+    _blockMd5List = null;
+    _fingerprint = null;
+  }
+
+  void _acceptSnapshot(
+    BaiduMd5Snapshot snapshot,
+    Map<String, int> before,
+  ) {
+    if (!_sameFingerprint(before, _readFingerprint())) {
+      _clearCache();
+      throw const BaiduUploadValidationException('计算上传摘要时文件发生变化，请稍后重新上传');
+    }
     _contentMd5 = snapshot.contentMd5;
     _sliceMd5 = snapshot.sliceMd5;
-    _blockMd5List = snapshot.blockMd5List;
+    _blockMd5List = List<String>.unmodifiable(snapshot.blockMd5List);
+    _fingerprint = before;
   }
+
+  Map<String, int> _readFingerprint() {
+    final stat = File(filePath).statSync();
+    if (stat.type != FileSystemEntityType.file) {
+      throw const BaiduUploadValidationException('待上传文件不存在或不是普通文件');
+    }
+    return {
+      'size': stat.size,
+      'modifiedMicros': stat.modified.microsecondsSinceEpoch,
+      'changedMicros': stat.changed.microsecondsSinceEpoch,
+    };
+  }
+
+  static bool _sameFingerprint(
+    Map<String, int>? before,
+    Map<String, int> after,
+  ) =>
+      before != null &&
+      before.length == after.length &&
+      after.entries.every((entry) => before[entry.key] == entry.value);
 
   Map<String, dynamic> toMap() {
     return {
@@ -246,6 +294,7 @@ class BaiduMd5 {
       'blockMd5List': _blockMd5List,
       'contentMd5': _contentMd5,
       'sliceMd5': _sliceMd5,
+      'fingerprint': _fingerprint,
     };
   }
 
@@ -256,10 +305,23 @@ class BaiduMd5 {
     );
     final blockMd5List = map['blockMd5List'];
     if (blockMd5List is List) {
-      instance._blockMd5List = blockMd5List.whereType<String>().toList();
+      instance._blockMd5List = List<String>.unmodifiable(
+        blockMd5List.whereType<String>(),
+      );
     }
     instance._contentMd5 = map['contentMd5'] as String?;
     instance._sliceMd5 = map['sliceMd5'] as String?;
+    final fingerprint = map['fingerprint'];
+    if (fingerprint is Map &&
+        fingerprint['size'] is int &&
+        fingerprint['modifiedMicros'] is int &&
+        fingerprint['changedMicros'] is int) {
+      instance._fingerprint = {
+        'size': fingerprint['size'] as int,
+        'modifiedMicros': fingerprint['modifiedMicros'] as int,
+        'changedMicros': fingerprint['changedMicros'] as int,
+      };
+    }
     return instance;
   }
 }

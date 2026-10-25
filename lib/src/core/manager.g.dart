@@ -116,7 +116,7 @@ class BaiduPanFileManager with BaiduPanMixin {
     DateTime? modifyTime,
   }) {
     final bodyParams = <String, String>{
-      'path': Uri.encodeComponent(path),
+      'path': path,
       'isdir': '1',
       'rtype': onDuplicateAction.rtype.toString(),
     };

@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:baidupan/baidupan.dart';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 
 part 'download.g.dart';
@@ -86,6 +88,7 @@ mixin BaiduPanMixin {
     String method = 'filemanager',
     Map<String, String> params = const {},
     Map<String, String> bodyParams = const {},
+    bool suppressLog = false,
   }) async {
     final uri = Uri.parse('$_baseUrl/$path').replace(queryParameters: {
       ...params,
@@ -93,16 +96,14 @@ mixin BaiduPanMixin {
       'method': method,
     });
 
-    final bodyMap = {
+    final bodyMap = <String, String>{
       ...bodyParams,
-      'async': 0,
+      if (method == 'filemanager') 'async': '0',
     };
-
-    final body = bodyMap.entries.map((e) => '${e.key}=${e.value}').join('&');
 
     final response = await http.post(
       uri,
-      body: body,
+      body: bodyMap,
       encoding: utf8,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -111,15 +112,17 @@ mixin BaiduPanMixin {
     var responseBody = response.body;
     final map = json.decode(responseBody);
 
-    if (showLog) {
+    if (showLog && !suppressLog) {
       print('uri: ${_logUri(response)}');
       print('method: POST');
-      print('body: $body');
+      print('body: ${Uri(queryParameters: bodyMap).query}');
       print('headers: ${_requestHeaders(response)}');
       print('response body: $responseBody');
     }
 
-    if (map['errno'] != 0) {
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        map['errno'] != 0) {
       // print(response.body);
       throw BaiduPanError(response);
     }
